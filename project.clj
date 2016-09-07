@@ -1,6 +1,6 @@
-(defproject yuppiechef/consul-clojure "0.5.4"
+(defproject yuppiechef/consul-clojure "0.5.5"
   :description "A Consul client for Clojure applications."
-  :url "http://github.com/bpoweski/consul-clojure"
+  :url "http://github.com/yuppiechef/consul-clojure"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[camel-snake-kebab "0.3.1" :exclusions [org.clojure/clojure com.keminglabs/cljx]]

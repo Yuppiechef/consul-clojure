@@ -1,6 +1,7 @@
 (ns consul.watch
-  (:require [consul.core :as consul]
-            [clojure.core.async :as async]))
+  (:require
+    [consul.core :as consul]
+    [clojure.core.async :as async]))
 
 (def watch-fns
   {:key       consul/kv-get
@@ -110,85 +111,158 @@
 
 ;; TODO: The session needs to manage its own ttl renewal and shutdown lifecycle.
 
+(def local-sessions (atom {}))
+
 (defn leader-watch
-  "Setup a leader election watch on a given key, sends a vector with [path true/false] when the
-   election changes.
-
-   If you close the leader-ch, it releases leader for the key"
-  [conn {:keys [lock-delay node name checks behavior ttl] :as session} k leader-ch {:keys [max-retry-wait query-params log] :as options}]
+  "Setup a leader election watch on a given key, sends a vector with [path true/false] when the election changes.
+   If you close the leader-ch, it will stop trying to renew leadership.
+   To kill leader immediately use `(kill-leader leader-ch)"
+  [conn session-opts k leader-ch {:keys [max-retry-wait query-params log] :as options}]
   (let [ch (async/chan)
-        log (or log (fn [& _]))]
-    (long-poll conn [:key k] ch query-params)
+        log (or log println)
+        log (partial log)
+        session-info (fn [session]
+                       (when session
+                         (try (:body (consul/session-info conn session))
+                              (catch Exception _ (log "Exception info session")))))
+        ensure-session (fn [session]
+                         (let [info (session-info session)]
+                           (if (seq info)
+                             (do (log "Session info:" info) session)
+                             (try
+                               (log "Create session " k)
+                               (consul/session-create conn session-opts)
+                               (catch Exception e
+                                 (log "Exception creating session: " (.getMessage e))
+                                 (.printStackTrace e))))))
+        aquire-session? (fn [session]
+                          (try
+                            (when session
+                              (log "Acquiring on " session)
+                              (let [a (consul/kv-put conn k "1" {:acquire session})]
+                                (log "Acquire: " a)
+                                a))
+                            (catch Exception e
+                              (log "Exception acquiring session: " (.getMessage e))
+                              (.printStackTrace e)
+                              false)))]
     (log "Start leader election on" k)
+    (consul.watch/long-poll conn [:key k] ch query-params)
     (async/go
-      ;; We don't need the initial value.
-      (async/<! ch)
       (loop [state {}]
-        (log "")
-        (log "")
-        (log "---------- Loop with " state)
-        (let [sessioninfo
-              (if (:session state)
-                (try (:body (consul/session-info conn (:session state)))
-                     (catch Exception e (log "Exception info session"))))
-              _ (log "session info: " sessioninfo)
-              sessionid
-              (if (nil? sessioninfo)
-                (try
-                  (log "Create session " k)
-                  (consul/session-create conn session)
-                  (catch Exception e (log "Exception creating session: " (.getMessage e)) (.printStackTrace e)))
-                (:session state))
-              _ (log "Sessionid: " sessionid)
-              state
-              (assoc state :session sessionid)
-              acquired?
-              (try
-                (when (and sessionid (not (:leader state)))
-                  (log "Acquiring on " sessionid)
-                  (let [a (consul/kv-put conn k "1" {:acquire sessionid})]
-                    (log "Acquire: " a)
-                    true))
-                (catch Exception e
-                  (log "Exception acquiring session: " (.getMessage e))
-                  (.printStackTrace e)
-                  false))]
+        (let [result (async/<! ch)
+              old-leader? (boolean (:leader state))]
+          (log "---------- Loop with " state)
 
-          (cond
-            ;; First, keep the session going, creating a new one if needed
-            (or (not acquired?) (nil? sessionid))
-            (when (async/>! leader-ch [k false])
-              (log "Invalid session, leader lost for" k " - " state)
-              (async/<! (async/timeout 2000))
-              (recur state))
-            :else
-            (do
-              (log "Waiting for change on " k ", session: " sessionid)
-              (when-let [result (async/<! ch)]
-                (log "Received: " result)
-                (cond
-                  (consul/ex-info? result)
-                  (when (async/>! leader-ch [k false])
-                    (log "Error, release leader for" k " - " (.getMessage result))
-                    (async/<! (async/timeout (exp-wait (or (:failures state) 0) (get options :max-retry-wait 5000))))
-                    (recur (update-state state result)))
-                  (and (:leader state) (not= sessionid (:session result)))
-                  (when (async/>! leader-ch [k false])
-                    (log "Leader lost for" k " - " result)
-                    (async/<! (async/timeout 15000))
-                    (recur (assoc state :leader false)))
-                  (and (not (:leader state)) (= sessionid (:session result)))
-                  (when (async/>! leader-ch [k true])
-                    (log "Leader gained for" k " - " result)
-                    (async/<! (async/timeout 15000))
-                    (recur (assoc state :leader true)))
-                  :else
-                  (do
-                    (async/<! (async/timeout 15000))
-                    (recur state))))))))
+          (if (consul/ex-info? result)
+            (let [failures (:failures state 0)
+                  timeout (consul.watch/exp-wait failures (get options :max-retry-wait (or max-retry-wait 5000)))]
+              (when (and old-leader? (zero? failures) (async/>! leader-ch [k false]))
+                (log "Error, release leader for" k " - " (.getMessage ^Throwable result)))
+              (log "Retrying in" timeout "ms")
+              (async/<! (async/timeout timeout))
+              (recur (consul.watch/update-state state result)))
 
-      ;; Release out here
-      (log "Finished and releasing:" k)
-      (async/>! leader-ch [k false])
-      (consul/kv-put conn k "1" {:release session}))))
+            (let [leader (:session result)
+                  session (ensure-session (:session state))
+                  _ (log "Sessionid:" session)
+                  _ (log "Leaderid: " leader)
+                  _ (swap! local-sessions assoc leader-ch {:conn conn :k k :session session})
+                  state (assoc state :session session)
+                  new-leader? (cond leader (= leader session)
+                                    (not old-leader?) (aquire-session? session)
+                                    old-leader? (when (async/>! leader-ch [k false])
+                                                  (aquire-session? session)))
+                  _ (log "Leader? " new-leader? result)
+                  continue? (or (= leader session)
+                                (async/>! leader-ch [k new-leader?]))]
+              (if continue?
+                (recur (assoc state :leader new-leader?))
+                (do (log "Finished and releasing:" k)
+                    (consul/kv-put conn k nil {:release session})
+                    (consul/session-destroy conn session)
+                    (async/>! leader-ch [k false]))))))))))
 
+(defn kill-leader!
+  "Given a channel representing a leader election node, give it a swift death."
+  [ch]
+  (async/close! ch)
+  (when-let [{:keys [conn k session]} (get @local-sessions ch)]
+    (consul/kv-put conn k nil {:release session})
+    (swap! local-sessions dissoc ch)))
+
+(defn kill-leader-pool!
+  "Attempt to evict all leaders and clear lock. Returns (assumed) success.
+   This will fail if there are any non-zombies, as they will reclaim the lock.
+   This works by attempting to evict sessions, and seeing if the session reconnects, so will spam stop/starts
+   for any non-zombies.
+   May return false positives if active leader has high latency.
+   Failure is not always negative.. it may mean a real leader has taken over from a zombie."
+  ([conn leader-key] (kill-leader-pool! conn leader-key 3))
+  ([conn leader-key n] (kill-leader-pool! conn leader-key n 300))
+  ([conn leader-key n next-leader-pause]
+   (not
+     (async/<!!
+       (async/go-loop [tries-left n]
+         (if (zero? tries-left)
+           true
+           (when-let [id (:session (consul.core/kv-get conn leader-key))]
+             (consul/kv-put :local leader-key nil {:release id})
+             (async/<! (async/timeout next-leader-pause))
+             (recur (dec tries-left)))))))))
+
+(comment
+  (def leader-key "/common/stuff/leader")
+
+  (def log-agent (agent nil))
+
+  (defn serial-log [& msgs]
+    (send-off log-agent #(apply println %2) msgs))
+
+  (defn close-component [var]
+    (when-let [old-ch (:ch @var)]
+      (println "closing..")
+      (kill-leader! old-ch))
+    (when-let [status (:status @var)]
+      (swap! status assoc :started false)))
+
+  (defn init-component [var id]
+    (close-component var)
+    (let [ch (async/chan)
+          status (or (:status @var) (atom {}))]
+      (reset! status {:started false :id id :bumps 0})
+      (leader-watch :local {:ttl "30m"} leader-key ch {:log (partial serial-log (str "[" id "]"))})
+      (async/go-loop []
+        (let [result (async/<! ch)]
+          (serial-log "Component:" id result)
+          (swap! status assoc :started (boolean (second result)))
+          (swap! status update :bumps inc)
+          (when result (recur))))
+      (alter-var-root var (constantly {:id id :ch ch :status status}))))
+
+  ;; BUGS:
+  ;; 1. when creating new session, seems to always fail (even if no leader). will work after timeout though
+
+  (declare comp-1)
+  (declare comp-2)
+  (declare comp-3)
+
+  (init-component #'comp-1 1)
+  (init-component #'comp-2 2)
+  (init-component #'comp-3 3)
+
+  (close-component #'comp-1)
+  (close-component #'comp-2)
+  (close-component #'comp-3)
+
+  (doseq [v [comp-1 comp-2 comp-3]]
+    (prn @(:status v)))
+
+  (run! kill-leader! (keys @watch/local-sessions))
+
+  (kill-leader-pool! :local leader-key)
+
+  (def session-id (:session (consul.core/kv-get :local leader-key)))
+  (consul/kv-put :local leader-key (str (Math/random)) (when session-id {:release session-id}))
+  (when session-id (consul/session-destroy :local session-id))
+  (when session-id (:body (consul/session-info :local session-id))))
