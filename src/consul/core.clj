@@ -188,7 +188,7 @@
   :string?    - Converts the value returned for k into a string.  Defaults to true."
   ([conn prefix]
     (kv-recurse conn prefix {:map? true}))
-  ([conn prefix {:as params :keys [string? map?] :or {string? true :map? true}}]
+  ([conn prefix {:as params :keys [string? map?] :or {string? true map? true}}]
    (let [{:keys [body headers] :as response}
          (consul conn :get [:kv prefix] {:query-params (assoc params :recurse "")})
          body (if (and body (seq? body)) (map #(kv-map-convert %1 string?) body))]
